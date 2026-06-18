@@ -6,6 +6,9 @@ import type { UserRole } from "@prisma/client";
  * y por la config completa (Node, con el provider de credenciales).
  */
 export const authConfig = {
+  // Deriva la URL base del host del request (Vercel) en vez de depender de
+  // NEXTAUTH_URL/AUTH_URL. Evita redirects a localhost en producción.
+  trustHost: true,
   pages: { signIn: "/login" },
   session: { strategy: "jwt" },
   providers: [], // el provider real se agrega en auth.ts (runtime Node)
