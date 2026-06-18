@@ -10,6 +10,8 @@
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
+    "db:status:prod": "set -a; . ./.env.prod; set +a; DATABASE_URL=\"$DIRECT_URL\" prisma migrate status",
+    "db:deploy:prod": "set -a; . ./.env.prod; set +a; DATABASE_URL=\"$DIRECT_URL\" prisma migrate deploy",
     "db:seed": "tsx prisma/seed.ts",
     "db:studio": "prisma studio",
     "db:reset": "prisma migrate reset",
