@@ -1,0 +1,24 @@
+# Postgres local para desarrollo.
+# Levantar con:  docker compose up -d
+# La app NO depende de Docker: solo lee DATABASE_URL del entorno (ver app/.env.example).
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: psicopy_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-psicopy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-psicopy}
+      POSTGRES_DB: ${POSTGRES_DB:-psicopy}
+    ports:
+      - "${POSTGRES_PORT:-5350}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-psicopy} -d ${POSTGRES_DB:-psicopy}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

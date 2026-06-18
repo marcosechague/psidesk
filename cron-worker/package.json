@@ -1,0 +1,17 @@
+{
+  "name": "psidesk-cron",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker que dispara el cron de Psidesk (solo hace fetch al endpoint de la app).",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "trigger": "wrangler dev --test-scheduled"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250901.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.80.0"
+  }
+}

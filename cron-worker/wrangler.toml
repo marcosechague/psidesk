@@ -1,0 +1,12 @@
+name = "psicopy-cron"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+# Cada 15 minutos. El endpoint es idempotente: si no hay nada que enviar, no hace nada.
+[triggers]
+crons = ["*/15 * * * *"]
+
+# URL pública del endpoint de la app. Cambiala por tu dominio real.
+# El secret NO va acá: se setea con `wrangler secret put CRON_SECRET`.
+[vars]
+TARGET_URL = "https://TU-APP.example.com/api/cron/reminders"

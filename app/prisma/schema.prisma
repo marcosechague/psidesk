@@ -1,0 +1,623 @@
+// Prisma schema — PostgreSQL (Docker en dev, Neon en prod).
+// La app solo lee DATABASE_URL del entorno; no sabe cuál motor hay detrás.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ────────────────────────────────────────────────────────────────
+/// Rol del usuario en la plataforma. SUPER_ADMIN administra la plataforma y da
+/// de alta a los psicólogos; PSYCHOLOGIST es el profesional (tenant aislado).
+enum UserRole {
+  SUPER_ADMIN
+  PSYCHOLOGIST
+}
+
+/// Configuración global de la plataforma (fila única, id "platform"). Lo edita
+/// solo el super admin. `featureFlags` es el interruptor MAESTRO por función:
+/// si una clave está en false, esa función queda apagada para TODA la plataforma
+/// (manda sobre los entitlements por psicólogo y las preferencias). Ausente = ON.
+model PlatformSettings {
+  id           String   @id @default("platform")
+  featureFlags Json?
+  /// proveedor de IA para el resumen ("anthropic"|"openai"|"google"|"deepseek"|"mock"). null = usar env
+  aiProvider   String?
+  /// modelo de IA (ej "claude-sonnet-4-6"). null = default del proveedor
+  aiModel      String?
+  updatedAt    DateTime @updatedAt
+}
+
+/// Estado comercial de la cuenta. Es informativo: el corte de acceso real lo
+/// sigue haciendo `User.active`. Sirve para saber quién está en beta/prueba y
+/// hasta cuándo, sin integrar pagos todavía.
+enum BillingStatus {
+  /// gratis mientras se mide el uso (beta cerrada)
+  BETA
+  /// prueba gratis acotada
+  TRIAL
+  /// suscripción al día
+  ACTIVE
+  /// venció la beta/prueba o dejó de pagar
+  EXPIRED
+}
+
+enum ResponseType {
+  BOOLEAN
+  SCALE_0_3
+  SCALE_0_3_FREQ
+  SCALE_AGREE_4
+}
+
+enum AssignmentStatus {
+  PENDING
+  COMPLETED
+}
+
+/// Quién cargó las respuestas de un test: el paciente (por el link) o el psicólogo (a mano).
+enum ResponseAuthor {
+  PATIENT
+  PROFESSIONAL
+}
+
+/// Quién produjo el resultado: el sistema (lo puntuó) o el psicólogo (lo cargó a mano).
+enum ResultAuthor {
+  SYSTEM
+  PROFESSIONAL
+}
+
+enum SessionStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELED
+  NO_SHOW
+}
+
+/// Tipo de mensaje saliente de WhatsApp. Cada tipo factura distinto en Meta y
+/// el psicólogo ve su consumo desglosado por tipo.
+enum WhatsAppMessageType {
+  /// check-in de seguimiento (pregunta programada al paciente)
+  CHECKIN
+  /// recordatorio de una cita/sesión
+  APPOINTMENT_REMINDER
+  /// aviso de cita: agendada, reprogramada o cancelada
+  APPOINTMENT_NOTICE
+  /// aviso de que se le asignó un test (con el link para responder)
+  TEST_ASSIGNED
+  /// recordatorio de completar un test antes del deadline
+  TEST_REMINDER
+  /// tarea/consigna enviada al paciente al finalizar una sesión
+  SESSION_TASK
+}
+
+enum CheckinQuestionType {
+  SCALE_1_10
+  YES_NO
+  CHOICE
+}
+
+enum CheckinFrequency {
+  DAILY
+  EVERY_N_DAYS
+  WEEKDAYS
+}
+
+enum CheckinPlanStatus {
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
+enum CheckinEntryStatus {
+  PENDING
+  SENT
+  RESPONDED
+  FAILED
+  SKIPPED
+}
+
+enum ProcessStatus {
+  ACTIVE
+  ENDED
+}
+
+// ── Modelos ──────────────────────────────────────────────────────────────
+
+/// Psicólogo (usuario del sistema)
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  /// rol en la plataforma (administra todo vs. profesional)
+  role         UserRole @default(PSYCHOLOGIST)
+  /// cuenta habilitada; un usuario inactivo no puede iniciar sesión
+  active       Boolean  @default(true)
+  /// obliga a cambiar la contraseña en el próximo ingreso (alta o reset del admin)
+  mustChangePassword Boolean @default(false)
+  /// estado comercial (beta/prueba/activo/vencido); informativo, lo gestiona el admin
+  billingStatus BillingStatus @default(BETA)
+  /// hasta cuándo vale el estado actual (fin de beta/prueba); null = sin vencimiento
+  billingUntil  DateTime?
+  /// funciones habilitadas por el super admin: { [featureKey]: boolean }. Ausente = ON (futuro: lo setea el plan)
+  featureEntitlements Json?
+  /// preferencias del psicólogo sobre las funciones habilitadas: { [featureKey]: boolean }. Ausente = ON
+  featurePreferences  Json?
+  /// horario de atención semanal: { "0".."6" (0=lunes): [{start,end} HH:MM] }. null = sin configurar (no sombrea)
+  availability        Json?
+  /// preferencia: usar emojis suaves en el mensaje al paciente (WhatsApp). Default ON.
+  patientMessageEmojis Boolean @default(true)
+  /// nombre completo, sincronizado = firstName + lastName (lo usa Auth.js)
+  name         String
+  firstName    String?
+  lastName     String?
+  /// prefijo/título para los mensajes ("Lic.", "Dra.", …); null = sin prefijo
+  prefix       String?
+  /// especialidades (valores de SPECIALTY_OPTIONS)
+  specialties  String[] @default([])
+  createdAt    DateTime @default(now())
+
+  patients Patient[]
+  sessions Session[]
+  tests    Test[]
+  whatsappMessages WhatsAppMessage[]
+  patientGroups    PatientGroup[]
+  noteTemplates    NoteTemplate[]
+  writingVoices    WritingVoice[]
+}
+
+/// Paciente creado por un psicólogo
+model Patient {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstName     String
+  lastName      String
+  /// nombre completo derivado (firstName + lastName); se mantiene al guardar — para mostrar y buscar
+  fullName      String
+  email         String?
+  /// teléfono con código de país, ej "+5491155551234" (para WhatsApp)
+  phone         String?
+  /// el paciente aceptó recibir mensajes de seguimiento por WhatsApp
+  whatsappOptIn Boolean  @default(false)
+  /// fecha de nacimiento; la edad se calcula a partir de ella
+  birthDate     DateTime?
+  sex           String?
+  maritalStatus String?
+  /// notas clínicas libres (legacy); migra a clinicalRecordJson.notes al editar
+  clinicalNotes String?
+  /// ficha clínica estructurada (anamnesis): factores de riesgo, antecedentes
+  /// personales/familiares, medicación, historia, fortalezas, notas. Ver
+  /// ClinicalRecordData en server/actions.ts
+  clinicalRecordJson Json?
+  createdAt     DateTime @default(now())
+
+  assignments           Assignment[]
+  sessionParticipations SessionParticipant[]
+  attachments           Attachment[]
+  checkinPlans          CheckinPlan[]
+  processes             Process[]
+  whatsappMessages      WhatsAppMessage[]
+  groupMemberships      PatientGroupMember[]
+  diagnoses             Diagnosis[]
+  manualResults         ManualResult[]
+
+  @@index([userId])
+}
+
+/// Resultado de un test cargado A MANO por el psicólogo (test tomado en papel o
+/// con copyright que no se puede digitalizar). Decoplado del flujo digital
+/// (Assignment/Response/Result): guarda los hallazgos ya interpretados.
+model ManualResult {
+  id        String   @id @default(cuid())
+  patientId String
+  patient   Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  /// nombre del test (libre o del catálogo), ej "DASS-42", "IPDE"
+  testName  String
+  /// cuándo se tomó/interpretó
+  takenAt   DateTime
+  /// hallazgos interpretados: [{ label, value }] — ej {"Ansiedad","Leve"}
+  findingsJson Json
+  /// interpretación / notas libres del profesional
+  notes     String?
+  createdAt DateTime @default(now())
+
+  @@index([patientId])
+}
+
+/// Diagnóstico CIE-10 (CIE/ICD-10) asociado a un paciente. Dato de salud sensible.
+model Diagnosis {
+  id        String   @id @default(cuid())
+  patientId String
+  patient   Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  /// código CIE-10, ej "F41.1", "Z63.0"
+  code      String
+  /// descripción del diagnóstico, ej "Trastorno de ansiedad generalizada"
+  label     String
+  /// diagnóstico principal del paciente (a lo sumo uno; se asegura en código)
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([patientId])
+}
+
+/// Grupo de pacientes (pareja/familia/grupo). Atajo para agendar + vista de
+/// historial; NO es un paciente ni una unidad clínica (tests/procesos/check-ins
+/// siguen por paciente). Tiene 2+ miembros (se valida en código).
+model PatientGroup {
+  id        String               @id @default(cuid())
+  userId    String
+  user      User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime             @default(now())
+  members   PatientGroupMember[]
+  sessions  Session[]
+
+  @@index([userId])
+}
+
+model PatientGroupMember {
+  id        String       @id @default(cuid())
+  groupId   String
+  group     PatientGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  patientId String
+  patient   Patient      @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, patientId])
+  @@index([patientId])
+}
+
+/// Proceso terapéutico: un curso de tratamiento del paciente, con su motivo de
+/// consulta, inicio y alta. Un paciente puede tener varios en el tiempo (alta y
+/// re-consulta). Las sesiones (vía SessionParticipant) y los tests cuelgan de un
+/// proceso. El proceso ACTIVE es el curso actual.
+model Process {
+  id        String        @id @default(cuid())
+  patientId String
+  patient   Patient       @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  /// motivo de consulta, narrativa libre (puede estar vacío hasta que el psicólogo lo complete)
+  motivo    String?
+  /// categoría del motivo de consulta (para filtros/estadísticas); ver MOTIVO_OPTIONS
+  motivoCategory String?
+  status    ProcessStatus @default(ACTIVE)
+  startedAt DateTime      @default(now())
+  /// alta / cierre del proceso (null = en curso)
+  endedAt   DateTime?
+  createdAt DateTime      @default(now())
+
+  participations SessionParticipant[]
+  assignments    Assignment[]
+  checkinPlans   CheckinPlan[]
+
+  @@index([patientId])
+}
+
+/// Archivo adjunto a la ficha de un paciente (datos de salud sensibles)
+model Attachment {
+  id         String   @id @default(cuid())
+  patientId  String
+  patient    Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  fileName   String
+  mimeType   String
+  size       Int
+  /// key/ruta en el storage (no es una URL pública)
+  storageKey String
+  /// driver con el que se guardó: "local" | "r2"
+  driver     String
+  createdAt  DateTime @default(now())
+
+  @@index([patientId])
+}
+
+/// Sesión: el encuentro clínico. Unifica la cita (agenda) con sus notas y
+/// su motivo. Los pacientes se vinculan vía SessionParticipant (0 = bloque de
+/// agenda, 1 = individual, 2+ = pareja/familia). Las notas compartidas viven
+/// acá; las individuales, en cada SessionParticipant.
+model Session {
+  id                String        @id @default(cuid())
+  userId            String
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// título libre, sobre todo para bloques sin paciente
+  title             String?
+  startsAt          DateTime
+  durationMin       Int           @default(50)
+  status            SessionStatus @default(SCHEDULED)
+  /// cuándo se marcó iniciada (para el cronómetro y el estado IN_PROGRESS)
+  startedAt         DateTime?
+  /// cuándo se finalizó
+  endedAt           DateTime?
+  /// motivo/tema de la sesión: clave de un preset (ej "ansiedad") o "otro"
+  topic             String?
+  /// texto libre del motivo cuando topic = "otro"
+  topicOther        String?
+  /// notas clínicas compartidas (de la sesión / pareja)
+  observations      String?
+  goals             String?
+  nextSteps         String?
+  /// resumen clínico generado con IA a partir de las observaciones (editable)
+  summary           String?
+  /// LEGACY: formato del resumen ("narrativo" | "soap" | "dap"). Reemplazado por
+  /// templateId (plantilla de estructura). Se conserva para sesiones viejas.
+  summaryFormat     String?
+  /// plantilla de estructura usada para el resumen (id de NoteTemplate, sin FK;
+  /// queda auditado y permite regenerar consistente aunque se borre la plantilla)
+  templateId        String?
+  /// voz/estilo de redacción usada al generar (id de WritingVoice, sin FK)
+  voiceId           String?
+  /// modelo de IA con el que se generó (auditoría)
+  summaryModel      String?
+  /// cuándo se generó el resumen
+  summaryAt         DateTime?
+  /// mensaje OPCIONAL para el paciente (qué se trabajó / tarea / recordatorio),
+  /// en lenguaje para el paciente. Distinto de las notas clínicas; se envía por
+  /// WhatsApp al cerrar la sesión. null/"" = no se envía nada.
+  patientMessage    String?
+  /// minutos antes de la sesión para enviar el recordatorio (null = sin recordatorio)
+  reminderOffsetMin Int?
+  /// avisar al paciente por WhatsApp al agendar/reprogramar/cancelar esta sesión
+  notifyPatient     Boolean       @default(true)
+  /// grupo al que pertenece la sesión (si se agendó "para un grupo"); null = individual/ad-hoc
+  groupId           String?
+  group             PatientGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  /// cuándo se envió el recordatorio (evita duplicados)
+  reminderSentAt    DateTime?
+  /// cuándo se envió la tarea de cierre al paciente por WhatsApp (evita duplicados)
+  taskSentAt        DateTime?
+  createdAt         DateTime      @default(now())
+
+  participants SessionParticipant[]
+
+  @@index([userId, startsAt])
+  @@index([groupId])
+}
+
+/// Participante de una sesión: vincula un paciente con una sesión y guarda sus
+/// notas individuales (privadas de esa persona en esa sesión). Una sesión de
+/// pareja tiene varios; una individual, uno.
+model SessionParticipant {
+  id              String   @id @default(cuid())
+  sessionId       String
+  session         Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  patientId       String
+  patient         Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  /// proceso terapéutico del paciente al que pertenece esta participación
+  processId       String?
+  process         Process? @relation(fields: [processId], references: [id], onDelete: SetNull)
+  /// notas individuales de este paciente en esta sesión
+  individualNotes String?
+  createdAt       DateTime @default(now())
+
+  /// un paciente no puede estar dos veces en la misma sesión
+  @@unique([sessionId, patientId])
+  @@index([patientId])
+  @@index([processId])
+}
+
+/// Tests disponibles: del sistema (precargados por seed) o creados por un psicólogo.
+model Test {
+  id                   String       @id @default(cuid())
+  /// dueño del test. null = test del sistema (catálogo compartido).
+  userId               String?
+  user                 User?        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// true = precargado por seed (catálogo); false = creado por un psicólogo.
+  isSystem             Boolean      @default(false)
+  /// código único de los tests del sistema (PHQ9, DASS42…). null en los custom.
+  code                 String?      @unique
+  name                 String
+  description          String
+  /// categorías temáticas (valores de TEST_CATEGORY_OPTIONS). Los del sistema las fijan en el seed.
+  categories           String[]     @default([])
+  responseType         ResponseType
+  /// si el paciente ve su resultado al terminar de responder.
+  showResultsToPatient Boolean      @default(false)
+  /// ítems del test. Custom: [{ text, options:[{value,label}] }]. Seed (legacy): string[].
+  /// Vacío [] en tests externos (de papel, sin motor de corrección).
+  itemsJson            Json
+  /// config de corrección: subescalas, ítems por subescala, puntos de corte.
+  /// Vacío {} en tests externos (el resultado lo carga el profesional a mano).
+  scoringJson          Json
+  /// true = el sistema sabe puntuarlo (catálogo/custom con motor). false = test
+  /// externo/de papel: el resultado siempre lo carga el profesional.
+  scored               Boolean      @default(true)
+
+  assignments Assignment[]
+
+  @@index([userId])
+}
+
+/// Plantilla de estructura para el resumen clínico: define QUÉ secciones tiene
+/// (SOAP, DAP, Narrativo, Primera sesión, TCC…). Del sistema (seed) o del
+/// psicólogo. Su `structure` se inyecta como guía de secciones en el prompt.
+model NoteTemplate {
+  id          String   @id @default(cuid())
+  /// dueño. null = plantilla del sistema (catálogo compartido).
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// true = precargada por seed; false = creada por un psicólogo.
+  isSystem    Boolean  @default(false)
+  /// código único de las del sistema (soap, dap…). null en las custom.
+  code        String?  @unique
+  name        String
+  description String?
+  /// spec de secciones (markdown/instrucciones) que se inyecta al prompt del resumen.
+  structure   String
+  /// plantilla por defecto del usuario (o del sistema). Una sola activa por dueño.
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+}
+
+/// Voz / estilo de redacción: lista de reglas (tono, largo, forma de las
+/// oraciones, cómo nombrar al paciente) que se aplican a TODO lo generado
+/// (resumen, próximos pasos, mensaje al paciente). Del sistema o del psicólogo.
+model WritingVoice {
+  id          String   @id @default(cuid())
+  /// dueño. null = voz del sistema.
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isSystem    Boolean  @default(false)
+  code        String?  @unique
+  name        String
+  description String?
+  /// reglas de redacción: string[] (cada regla es una instrucción breve).
+  rulesJson   Json
+  /// voz por defecto del usuario (o del sistema). Una sola activa por dueño.
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+}
+
+/// Asignación de un test a un paciente (genera el link público con token)
+model Assignment {
+  id          String           @id @default(cuid())
+  patientId   String
+  patient     Patient          @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  /// proceso terapéutico al que pertenece el test
+  processId   String?
+  process     Process?         @relation(fields: [processId], references: [id], onDelete: SetNull)
+  testId      String
+  test        Test             @relation(fields: [testId], references: [id], onDelete: Restrict)
+  token       String           @unique
+  status      AssignmentStatus @default(PENDING)
+  createdAt   DateTime         @default(now())
+  completedAt DateTime?
+
+  /// fecha tope opcional para responder
+  dueDate            DateTime?
+  /// días antes de dueDate en que recordar (ej [2,1,0]); vacío = sin recordatorios
+  reminderOffsetsDays Int[]   @default([])
+  /// offsets ya enviados (idempotencia del cron; un recordatorio por offset)
+  remindersSentDays   Int[]   @default([])
+  /// avisar al paciente por WhatsApp/email cuando se asigna el test
+  notifyOnAssign      Boolean @default(true)
+
+  response Response?
+  result   Result?
+
+  @@index([patientId])
+  @@index([testId])
+  @@index([processId])
+}
+
+/// Respuestas crudas del test. Las carga el paciente (por el link) o el psicólogo
+/// (a mano). objeto { numeroItem: valor }.
+model Response {
+  id           String         @id @default(cuid())
+  assignmentId String         @unique
+  assignment   Assignment     @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  /// objeto { numeroItem: valor }
+  answersJson  Json
+  /// quién cargó las respuestas
+  enteredBy    ResponseAuthor @default(PATIENT)
+  createdAt    DateTime       @default(now())
+}
+
+/// Resultado de un test. Lo genera el sistema (puntaje por subescala) o lo carga
+/// el profesional a mano (hallazgos libres). Siempre editable por el profesional.
+model Result {
+  id           String       @id @default(cuid())
+  assignmentId String       @unique
+  assignment   Assignment   @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  /// puntaje por subescala { mode, scores:[...] }. null en resultados sin motor.
+  scoresJson   Json?
+  /// hallazgos libres [{ label, value }] para tests externos/sin motor. null si scored.
+  findingsJson Json?
+  /// interpretación / notas del profesional
+  notes        String?
+  /// quién produjo el resultado: el sistema o el profesional
+  source       ResultAuthor @default(SYSTEM)
+  /// cuándo el profesional editó el resultado a mano (null = sin editar)
+  editedAt     DateTime?
+  /// cuándo el psicólogo abrió el informe por primera vez (null = sin revisar)
+  reviewedAt   DateTime?
+  createdAt    DateTime     @default(now())
+}
+
+/// Plan de seguimiento: una pregunta que se envía al paciente por WhatsApp
+/// con cierta frecuencia, entre dos fechas. Genera una CheckinEntry por toma.
+model CheckinPlan {
+  id           String              @id @default(cuid())
+  patientId    String
+  patient      Patient             @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  /// tratamiento (proceso) al que pertenece el seguimiento; null si el proceso se borró
+  processId    String?
+  process      Process?            @relation(fields: [processId], references: [id], onDelete: SetNull)
+  question     String
+  questionType CheckinQuestionType
+  /// opciones para CHOICE (array de strings). Vacío en SCALE/YES_NO.
+  optionsJson  Json?
+  frequency    CheckinFrequency
+  /// para EVERY_N_DAYS: cada cuántos días (>=1)
+  everyNDays   Int?
+  /// para WEEKDAYS: días de la semana (0=domingo … 6=sábado)
+  weekdaysJson Json?
+  /// hora local de envío, "HH:MM"
+  timeOfDay    String
+  /// zona horaria IANA para interpretar timeOfDay y los días
+  timezone     String              @default("America/Argentina/Buenos_Aires")
+  startDate    DateTime
+  endDate      DateTime
+  status       CheckinPlanStatus   @default(ACTIVE)
+  createdAt    DateTime            @default(now())
+
+  entries CheckinEntry[]
+
+  @@index([patientId])
+  @@index([processId])
+  @@index([status])
+}
+
+/// Una toma del seguimiento: el envío de la pregunta en una fecha y su respuesta.
+model CheckinEntry {
+  id                String             @id @default(cuid())
+  planId            String
+  plan              CheckinPlan        @relation(fields: [planId], references: [id], onDelete: Cascade)
+  /// instante en que correspondía enviar (fecha local + timeOfDay, en UTC)
+  scheduledFor      DateTime
+  status            CheckinEntryStatus @default(PENDING)
+  sentAt            DateTime?
+  /// id del mensaje devuelto por el proveedor de WhatsApp
+  providerMessageId String?
+  /// respuesta cruda del paciente
+  responseText      String?
+  /// valor numérico parseado: escala (1-10), sí/no (1/0) o índice de opción (1-based)
+  responseValue     Int?
+  respondedAt       DateTime?
+  createdAt         DateTime           @default(now())
+
+  /// una sola toma por plan por instante programado (idempotencia del cron)
+  @@unique([planId, scheduledFor])
+  @@index([status])
+}
+
+/// Registro de mensajes salientes de WhatsApp (uno por envío exitoso). Fuente
+/// única para medir consumo (proxy de costo Meta) y mostrarlo por tipo. Las
+/// referencias a paciente/sesión son SetNull para no perder el dato de consumo
+/// del mes aunque luego se borren.
+model WhatsAppMessage {
+  id                String              @id @default(cuid())
+  /// dueño (psicólogo) — para contar y aislar por tenant
+  userId            String
+  user              User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  patientId         String?
+  patient           Patient?            @relation(fields: [patientId], references: [id], onDelete: SetNull)
+  type              WhatsAppMessageType
+  sentAt            DateTime            @default(now())
+  /// id del mensaje devuelto por el proveedor
+  providerMessageId String?
+  /// origen opcional (no son FKs para no acoplar): sesión o toma de check-in
+  sessionId         String?
+  checkinEntryId    String?
+  createdAt         DateTime            @default(now())
+
+  @@index([userId, sentAt])
+  @@index([type])
+}
